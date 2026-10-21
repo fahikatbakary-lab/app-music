@@ -618,7 +618,7 @@
   <script>
     const DEEZER_BASE = 'https://api.deezer.com/search?q=';
 
-    async function fetchWithFallback(targetUrl) {
+    async function fetchDeezer(targetUrl) {
       const response = await fetch(targetUrl, { signal: AbortSignal.timeout(10000) });
       if (!response.ok) throw new Error(`Deezer API: HTTP ${response.status}`);
       const data = await response.json();
@@ -695,8 +695,8 @@
       try {
         const encodedQuery = encodeURIComponent(q.trim());
         const [trackData, artistSearchData] = await Promise.all([
-          fetchWithFallback(DEEZER_BASE + encodedQuery + '&limit=50'),
-          fetchWithFallback(`https://api.deezer.com/search/artist?q=${encodedQuery}&limit=5`).catch(() => null),
+          fetchDeezer(DEEZER_BASE + encodedQuery + '&limit=50'),
+          fetchDeezer(`https://api.deezer.com/search/artist?q=${encodedQuery}&limit=5`).catch(() => null),
         ]);
         if (searchId !== latestSearchId) return;
 
@@ -704,9 +704,10 @@
           artist.name?.trim().toLocaleLowerCase() === q.trim().toLocaleLowerCase()
         );
         let candidateTracks = trackData?.data || [];
+        let resultSource = 'Deezer';
 
         if (exactArtist) {
-          const artistTopData = await fetchWithFallback(
+          const artistTopData = await fetchDeezer(
             `https://api.deezer.com/artist/${exactArtist.id}/top?limit=50`
           ).catch(() => null);
           if (searchId !== latestSearchId) return;
@@ -715,6 +716,8 @@
           );
           if (artistTracks?.length) candidateTracks = artistTracks;
         }
+
+        if (!Array.isArray(candidateTracks)) candidateTracks = [];
 
         const uniqueTracks = new Map();
         for (const track of candidateTracks) {
@@ -730,20 +733,57 @@
           return;
         }
 
-        renderResults(tracks, q);
+        renderResults(tracks, q, resultSource);
       } catch(e) {
-        if (searchId === latestSearchId) {
-          showError('⚠️ Impossible de charger les résultats depuis Deezer. Vérifie ta connexion ou réessaie dans quelques instants.');
-          document.getElementById('emptyState').style.display = 'none';
+        if (searchId !== latestSearchId) return;
+
+        try {
+          const fallbackUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(q.trim())}&entity=song&limit=50`;
+          const response = await fetch(fallbackUrl, { signal: AbortSignal.timeout(10000) });
+          if (!response.ok) throw new Error(`Apple Search API: HTTP ${response.status}`);
+          const fallbackData = await response.json();
+          if (searchId !== latestSearchId) return;
+
+          const fallbackTracks = (fallbackData.results || []).map(track => {
+            const cover = track.artworkUrl100?.replace('100x100bb', '400x400bb') || track.artworkUrl100;
+            return {
+              id: `itunes-${track.trackId}`,
+              title: track.trackName,
+              preview: track.previewUrl,
+              artist: { id: track.artistId, name: track.artistName },
+              album: { cover_medium: cover, cover_small: track.artworkUrl100 },
+            };
+          });
+          const uniqueTracks = new Map();
+          for (const track of fallbackTracks) {
+            if (track.title && track.preview && safeHttpsUrl(track.preview) && !uniqueTracks.has(track.id)) {
+              uniqueTracks.set(track.id, track);
+            }
+          }
+          tracks = [...uniqueTracks.values()];
+
+          if (tracks.length === 0) {
+            document.getElementById('emptyState').style.display = 'block';
+            document.getElementById('emptyState').querySelector('p').textContent =
+              'Aucun résultat avec extrait audio disponible pour "' + q + '"';
+            return;
+          }
+
+          renderResults(tracks, q, 'Apple previews');
+        } catch(fallbackError) {
+          if (searchId === latestSearchId) {
+            showError('⚠️ Deezer et la recherche de secours sont indisponibles. Vérifie ta connexion ou réessaie plus tard.');
+            document.getElementById('emptyState').style.display = 'none';
+          }
         }
       } finally {
         if (searchId === latestSearchId) showLoading(false);
       }
     }
 
-    function renderResults(list, q) {
+    function renderResults(list, q, source) {
       const grid = document.getElementById('resultsGrid');
-      document.getElementById('resultsLabel').textContent = `${list.length} résultat${list.length>1?'s':''} pour "${q}"`;
+      document.getElementById('resultsLabel').textContent = `${list.length} résultat${list.length>1?'s':''} pour "${q}" · ${source}`;
       grid.innerHTML = '';
 
       list.forEach((track, i) => {
