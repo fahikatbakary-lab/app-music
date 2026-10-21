@@ -221,6 +221,10 @@
       border-radius: 16px;
       overflow: hidden;
       cursor: pointer;
+      width: 100%;
+      color: inherit;
+      font: inherit;
+      text-align: left;
       transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s;
       position: relative;
     }
@@ -234,6 +238,11 @@
     .track-card.active {
       border-color: var(--accent2);
       box-shadow: 0 0 0 2px rgba(168,85,247,0.3);
+    }
+
+    .track-card:focus-visible {
+      outline: 3px solid var(--accent3);
+      outline-offset: 3px;
     }
 
     .track-cover {
@@ -407,6 +416,20 @@
       gap: 1rem;
     }
 
+    .volume-control {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      width: 120px;
+      flex-shrink: 0;
+    }
+
+    .volume-slider {
+      width: 100%;
+      accent-color: var(--accent3);
+      cursor: pointer;
+    }
+
     .ctrl-btn {
       background: none;
       border: none;
@@ -477,12 +500,18 @@
 
     /* Responsive */
     @media (max-width: 600px) {
-      header { padding: 1rem; }
+      header { padding: 1rem; flex-wrap: wrap; gap: 0.5rem; }
+      .header-note { max-width: 100%; white-space: normal; }
       .container { padding: 1.5rem 1rem 6rem; }
       .search-label { font-size: 1.5rem; }
-      .results-grid { grid-template-columns: repeat(2, 1fr); gap: 0.75rem; }
+      .search-input { min-width: 0; }
+      .search-btn { padding: 0 0.9rem; }
+      .results-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; }
       .progress-wrap { display: none; }
-      .player-bar { gap: 0.75rem; padding: 0.75rem 1rem; }
+      .player-bar { gap: 0.5rem; padding: 0.75rem 1rem; }
+      .player-controls { gap: 0.25rem; }
+      .ctrl-btn { padding: 0.25rem; }
+      .volume-control { width: 78px; gap: 0.2rem; }
       .preview-badge { display: none; }
     }
   </style>
@@ -564,13 +593,21 @@
         </svg>
       </button>
     </div>
+    <div class="volume-control">
+      <button class="ctrl-btn" id="volumeBtn" type="button" title="Couper le son" aria-label="Couper le son" aria-pressed="false">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path d="M3 9v6h4l5 4V5L7 9H3zm13.5 3a3.5 3.5 0 0 0-2-3.16v6.32a3.5 3.5 0 0 0 2-3.16zM14.5 3.23v2.06a7 7 0 0 1 0 13.42v2.06a9 9 0 0 0 0-17.54z"/>
+        </svg>
+      </button>
+      <input class="volume-slider" id="volumeControl" type="range" min="0" max="1" step="0.05" value="0.8" aria-label="Volume" />
+    </div>
     <div class="progress-wrap">
-      <div class="progress-bar" id="progressBar">
+      <div class="progress-bar" id="progressBar" role="slider" aria-label="Position dans l’extrait" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" tabindex="0">
         <div class="progress-fill" id="progressFill"></div>
       </div>
       <div class="time-display">
         <span id="timeElapsed">0:00</span>
-        <span id="timeDuration">0:30</span>
+        <span id="timeDuration">0:00</span>
       </div>
     </div>
     <div class="preview-badge">Préview 30s</div>
@@ -581,37 +618,19 @@
   <script>
     const DEEZER_BASE = 'https://api.deezer.com/search?q=';
 
-    const PROXIES = [
-      url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-      url => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
-      url => `https://cors-anywhere.herokuapp.com/${url}`,
-    ];
-
     async function fetchWithFallback(targetUrl) {
-      // Try direct first (works on some setups)
-      for (let i = 0; i < PROXIES.length; i++) {
-        const proxyUrl = PROXIES[i](targetUrl);
-        try {
-          const res = await fetch(proxyUrl, { signal: AbortSignal.timeout(6000) });
-          if (!res.ok) continue;
-          const text = await res.text();
-          // allorigins wraps in {contents: "..."}
-          try {
-            const wrapped = JSON.parse(text);
-            if (wrapped.contents) return JSON.parse(wrapped.contents);
-            return wrapped;
-          } catch {
-            return JSON.parse(text);
-          }
-        } catch(e) {
-          if (i === PROXIES.length - 1) throw e;
-        }
-      }
+      const response = await fetch(targetUrl, { signal: AbortSignal.timeout(10000) });
+      if (!response.ok) throw new Error(`Deezer API: HTTP ${response.status}`);
+      const data = await response.json();
+      if (data.error) throw new Error(data.error.message || 'Erreur de l’API Deezer');
+      return data;
     }
 
     let tracks = [];
+    let playbackQueue = [];
     let currentIndex = -1;
     let isPlaying = false;
+    let latestSearchId = 0;
 
     const audio = document.getElementById('audioEl');
     const playerBar = document.getElementById('playerBar');
@@ -621,6 +640,10 @@
     const progressFill = document.getElementById('progressFill');
     const timeElapsed = document.getElementById('timeElapsed');
     const timeDuration = document.getElementById('timeDuration');
+    const volumeBtn = document.getElementById('volumeBtn');
+    const volumeControl = document.getElementById('volumeControl');
+    let previousVolume = Number(volumeControl.value);
+    audio.volume = previousVolume;
 
     const COLORS = [
       ['#ff6b35','#a855f7'],
@@ -638,6 +661,19 @@
       return `${m}:${sec.toString().padStart(2,'0')}`;
     }
 
+    function fmtDuration(s) {
+      return fmtTime(Math.round(s));
+    }
+
+    function safeHttpsUrl(value) {
+      try {
+        const url = new URL(value);
+        return url.protocol === 'https:' ? url.href : '';
+      } catch {
+        return '';
+      }
+    }
+
     function showLoading(v) {
       document.getElementById('loadingEl').style.display = v ? 'flex' : 'none';
     }
@@ -650,29 +686,58 @@
 
     async function search(q) {
       if (!q.trim()) return;
+      const searchId = ++latestSearchId;
       showError(null);
       showLoading(true);
       document.getElementById('emptyState').style.display = 'none';
       document.getElementById('resultsSection').style.display = 'none';
 
       try {
-        const targetUrl = DEEZER_BASE + encodeURIComponent(q) + '&limit=20';
-        const data = await fetchWithFallback(targetUrl);
+        const encodedQuery = encodeURIComponent(q.trim());
+        const [trackData, artistSearchData] = await Promise.all([
+          fetchWithFallback(DEEZER_BASE + encodedQuery + '&limit=50'),
+          fetchWithFallback(`https://api.deezer.com/search/artist?q=${encodedQuery}&limit=5`).catch(() => null),
+        ]);
+        if (searchId !== latestSearchId) return;
 
-        if (!data.data || data.data.length === 0) {
-          showLoading(false);
+        const exactArtist = artistSearchData?.data?.find(artist =>
+          artist.name?.trim().toLocaleLowerCase() === q.trim().toLocaleLowerCase()
+        );
+        let candidateTracks = trackData?.data || [];
+
+        if (exactArtist) {
+          const artistTopData = await fetchWithFallback(
+            `https://api.deezer.com/artist/${exactArtist.id}/top?limit=50`
+          ).catch(() => null);
+          if (searchId !== latestSearchId) return;
+          const artistTracks = artistTopData?.data?.filter(track =>
+            String(track.artist?.id) === String(exactArtist.id)
+          );
+          if (artistTracks?.length) candidateTracks = artistTracks;
+        }
+
+        const uniqueTracks = new Map();
+        for (const track of candidateTracks) {
+          if (track?.preview && safeHttpsUrl(track.preview) && !uniqueTracks.has(track.id)) {
+            uniqueTracks.set(track.id, track);
+          }
+        }
+        tracks = [...uniqueTracks.values()];
+        if (tracks.length === 0) {
           document.getElementById('emptyState').style.display = 'block';
-          document.getElementById('emptyState').querySelector('p').textContent = 'Aucun résultat pour "' + q + '"';
+          document.getElementById('emptyState').querySelector('p').textContent =
+            candidateTracks.length ? 'Aucun extrait audio disponible pour "' + q + '"' : 'Aucun résultat pour "' + q + '"';
           return;
         }
 
-        tracks = data.data.filter(t => t.preview);
         renderResults(tracks, q);
       } catch(e) {
-        showError('⚠️ Impossible de contacter l\'API Deezer via les proxies disponibles.<br><small>Si tu es en local, essaie d\'ouvrir le fichier via <b>npx serve .</b> ou un navigateur sans restrictions CORS.</small>');
-        document.getElementById('emptyState').style.display = 'none';
+        if (searchId === latestSearchId) {
+          showError('⚠️ Impossible de charger les résultats depuis Deezer. Vérifie ta connexion ou réessaie dans quelques instants.');
+          document.getElementById('emptyState').style.display = 'none';
+        }
       } finally {
-        showLoading(false);
+        if (searchId === latestSearchId) showLoading(false);
       }
     }
 
@@ -683,30 +748,48 @@
 
       list.forEach((track, i) => {
         const [c1, c2] = colorFor(i);
-        const card = document.createElement('div');
+        const card = document.createElement('button');
+        card.type = 'button';
         card.className = 'track-card';
         card.dataset.index = i;
+        card.setAttribute('aria-label', `Lire ${track.title} par ${track.artist.name}`);
 
-        const coverHTML = track.album.cover_medium
-          ? `<img class="track-cover" src="${track.album.cover_medium}" alt="${track.title}" loading="lazy" />`
-          : `<div class="cover-placeholder" style="background:linear-gradient(135deg,${c1},${c2})">🎵</div>`;
+        const coverUrl = safeHttpsUrl(track.album?.cover_medium);
+        if (coverUrl) {
+          const cover = document.createElement('img');
+          cover.className = 'track-cover';
+          cover.src = coverUrl;
+          cover.alt = track.title || '';
+          cover.loading = 'lazy';
+          card.appendChild(cover);
+        } else {
+          const placeholder = document.createElement('div');
+          placeholder.className = 'cover-placeholder';
+          placeholder.style.background = `linear-gradient(135deg,${c1},${c2})`;
+          placeholder.textContent = '🎵';
+          card.appendChild(placeholder);
+        }
 
-        card.innerHTML = `
-          ${coverHTML}
-          <div class="play-overlay">
-            <div class="play-circle">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="${c1}">
-                <path d="M8 5v14l11-7z"/>
-              </svg>
-            </div>
-          </div>
-          <div class="track-info">
-            <div class="track-title">${track.title}</div>
-            <div class="track-artist">${track.artist.name}</div>
-          </div>
-        `;
+        const overlay = document.createElement('div');
+        overlay.className = 'play-overlay';
+        overlay.innerHTML = `<div class="play-circle"><svg width="22" height="22" viewBox="0 0 24 24" fill="${c1}"><path d="M8 5v14l11-7z"/></svg></div>`;
+        card.appendChild(overlay);
 
-        card.addEventListener('click', () => playTrack(i));
+        const info = document.createElement('div');
+        info.className = 'track-info';
+        const title = document.createElement('div');
+        title.className = 'track-title';
+        title.textContent = track.title || 'Titre inconnu';
+        const artist = document.createElement('div');
+        artist.className = 'track-artist';
+        artist.textContent = track.artist?.name || 'Artiste inconnu';
+        info.append(title, artist);
+        card.appendChild(info);
+
+        card.addEventListener('click', () => {
+          playbackQueue = tracks;
+          playTrack(i);
+        });
         grid.appendChild(card);
       });
 
@@ -714,9 +797,9 @@
     }
 
     function playTrack(index) {
-      if (index < 0 || index >= tracks.length) return;
+      if (index < 0 || index >= playbackQueue.length) return;
       currentIndex = index;
-      const track = tracks[index];
+      const track = playbackQueue[index];
 
       // Update active card
       document.querySelectorAll('.track-card').forEach(c => c.classList.remove('active'));
@@ -727,22 +810,40 @@
       const thumbWrap = document.getElementById('playerThumbWrap');
       const [c1, c2] = colorFor(index);
 
-      if (track.album.cover_small) {
-        thumbWrap.innerHTML = `<img class="player-thumb spinning" src="${track.album.cover_small}" alt="" />`;
+      const coverUrl = safeHttpsUrl(track.album?.cover_small);
+      if (coverUrl) {
+        const thumb = document.createElement('img');
+        thumb.className = 'player-thumb spinning';
+        thumb.src = coverUrl;
+        thumb.alt = '';
+        thumbWrap.replaceChildren(thumb);
       } else {
-        thumbWrap.innerHTML = `<div class="player-thumb-placeholder" style="background:linear-gradient(135deg,${c1},${c2})">🎵</div>`;
+        const placeholder = document.createElement('div');
+        placeholder.className = 'player-thumb-placeholder';
+        placeholder.style.background = `linear-gradient(135deg,${c1},${c2})`;
+        placeholder.textContent = '🎵';
+        thumbWrap.replaceChildren(placeholder);
       }
 
       document.getElementById('playerTitle').textContent = track.title;
       document.getElementById('playerArtist').textContent = track.artist.name;
 
       // Play audio
-      audio.src = track.preview;
+      progressFill.style.width = '0%';
+      timeElapsed.textContent = '0:00';
+      timeDuration.textContent = '0:00';
+      audio.src = safeHttpsUrl(track.preview);
+      startPlayback();
+    }
+
+    function startPlayback() {
       audio.play().then(() => {
         isPlaying = true;
         updatePlayPauseUI();
         playerBar.classList.add('visible');
       }).catch(() => {
+        isPlaying = false;
+        updatePlayPauseUI();
         showError('La lecture a été bloquée par votre navigateur. Essayez un autre titre.');
       });
     }
@@ -750,6 +851,7 @@
     function updatePlayPauseUI() {
       playIcon.style.display = isPlaying ? 'none' : 'block';
       pauseIcon.style.display = isPlaying ? 'block' : 'none';
+      playPauseBtn.setAttribute('aria-label', isPlaying ? 'Mettre en pause' : 'Lire');
 
       // Update spinning
       const img = document.querySelector('.player-thumb.spinning');
@@ -763,39 +865,87 @@
         if (isPlaying) {
           audio.pause();
           isPlaying = false;
+          updatePlayPauseUI();
         } else {
-          audio.play();
-          isPlaying = true;
+          startPlayback();
         }
-        updatePlayPauseUI();
       }
     });
+
+    function updateVolumeUI() {
+      volumeControl.value = audio.muted ? '0' : String(audio.volume);
+      const muted = audio.muted || audio.volume === 0;
+      volumeBtn.setAttribute('aria-label', muted ? 'Activer le son' : 'Couper le son');
+      volumeBtn.title = muted ? 'Activer le son' : 'Couper le son';
+      volumeBtn.setAttribute('aria-pressed', String(muted));
+    }
+
+    volumeBtn.addEventListener('click', () => {
+      if (audio.muted || audio.volume === 0) {
+        audio.muted = false;
+        audio.volume = previousVolume || 0.8;
+      } else {
+        previousVolume = audio.volume;
+        audio.muted = true;
+      }
+      updateVolumeUI();
+    });
+
+    volumeControl.addEventListener('input', () => {
+      audio.volume = Number(volumeControl.value);
+      audio.muted = audio.volume === 0;
+      if (audio.volume > 0) previousVolume = audio.volume;
+      updateVolumeUI();
+    });
+
+    audio.addEventListener('volumechange', updateVolumeUI);
 
     document.getElementById('prevBtn').addEventListener('click', () => {
       if (currentIndex > 0) playTrack(currentIndex - 1);
     });
 
     document.getElementById('nextBtn').addEventListener('click', () => {
-      if (currentIndex < tracks.length - 1) playTrack(currentIndex + 1);
+      if (currentIndex < playbackQueue.length - 1) playTrack(currentIndex + 1);
     });
 
     audio.addEventListener('ended', () => {
-      if (currentIndex < tracks.length - 1) playTrack(currentIndex + 1);
+      if (currentIndex < playbackQueue.length - 1) playTrack(currentIndex + 1);
       else { isPlaying = false; updatePlayPauseUI(); }
     });
 
     audio.addEventListener('timeupdate', () => {
       const pct = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0;
       progressFill.style.width = pct + '%';
+      document.getElementById('progressBar').setAttribute('aria-valuenow', Math.round(pct));
       timeElapsed.textContent = fmtTime(audio.currentTime);
-      if (audio.duration) timeDuration.textContent = fmtTime(audio.duration);
+      if (audio.duration) timeDuration.textContent = fmtDuration(audio.duration);
+    });
+
+    audio.addEventListener('loadedmetadata', () => {
+      if (Number.isFinite(audio.duration)) timeDuration.textContent = fmtDuration(audio.duration);
+    });
+
+    audio.addEventListener('durationchange', () => {
+      if (Number.isFinite(audio.duration)) timeDuration.textContent = fmtDuration(audio.duration);
     });
 
     document.getElementById('progressBar').addEventListener('click', e => {
       if (!audio.duration) return;
       const rect = e.currentTarget.getBoundingClientRect();
-      const pct = (e.clientX - rect.left) / rect.width;
+      const pct = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
       audio.currentTime = pct * audio.duration;
+    });
+
+    document.getElementById('progressBar').addEventListener('keydown', e => {
+      if (!audio.duration) return;
+      let pct = audio.currentTime / audio.duration;
+      if (e.key === 'ArrowRight') pct += 0.05;
+      else if (e.key === 'ArrowLeft') pct -= 0.05;
+      else if (e.key === 'Home') pct = 0;
+      else if (e.key === 'End') pct = 1;
+      else return;
+      e.preventDefault();
+      audio.currentTime = Math.min(1, Math.max(0, pct)) * audio.duration;
     });
 
     // Search handlers
